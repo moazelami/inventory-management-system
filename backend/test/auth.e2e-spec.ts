@@ -45,13 +45,21 @@ function matchesWhere(row: FakeRow, where: FakeRow = {}): boolean {
     return false;
   }
   const idFilter = where['id'] as { not?: string } | string | undefined;
-  if (idFilter && typeof idFilter === 'object' && idFilter.not && row['id'] === idFilter.not) {
+  if (
+    idFilter &&
+    typeof idFilter === 'object' &&
+    idFilter.not &&
+    row['id'] === idFilter.not
+  ) {
     return false;
   }
   if (typeof where['role'] === 'string' && row['role'] !== where['role']) {
     return false;
   }
-  if (typeof where['isActive'] === 'boolean' && row['isActive'] !== where['isActive']) {
+  if (
+    typeof where['isActive'] === 'boolean' &&
+    row['isActive'] !== where['isActive']
+  ) {
     return false;
   }
   const or = where['OR'] as FakeRow[] | undefined;
@@ -62,11 +70,21 @@ function matchesWhere(row: FakeRow, where: FakeRow = {}): boolean {
 }
 
 function createFakePrisma(db: FakeDb) {
-  return {
+  const fakePrisma = {
     async onModuleInit() {},
     async onModuleDestroy() {},
     async $queryRaw() {
       return [{ 1: 1 }];
+    },
+    async $transaction<T>(
+      fnOrArray:
+        | ((tx: unknown) => Promise<T>)
+        | Array<Promise<unknown>>,
+    ): Promise<T> {
+      if (typeof fnOrArray === 'function') {
+        return fnOrArray(fakePrisma);
+      }
+      return Promise.all(fnOrArray) as unknown as Promise<T>;
     },
     user: {
       async findUnique(args: {
@@ -87,22 +105,27 @@ function createFakePrisma(db: FakeDb) {
         const orderBy = args.orderBy ?? {};
         const [key, dir] = Object.entries(orderBy)[0] ?? ['createdAt', 'desc'];
         rows = [...rows].sort((a, b) => {
-          const av = a[key] instanceof Date ? (a[key] as Date).getTime() : String(a[key]);
-          const bv = b[key] instanceof Date ? (b[key] as Date).getTime() : String(b[key]);
+          const av =
+            a[key] instanceof Date
+              ? (a[key] as Date).getTime()
+              : String(a[key]);
+          const bv =
+            b[key] instanceof Date
+              ? (b[key] as Date).getTime()
+              : String(b[key]);
           const cmp = av < bv ? -1 : av > bv ? 1 : 0;
           return dir === 'desc' ? -cmp : cmp;
         });
         const skip = args.skip ?? 0;
         const take = args.take ?? rows.length;
-        return rows.slice(skip, skip + take).map((r) => project(r, args.select));
+        return rows
+          .slice(skip, skip + take)
+          .map((r) => project(r, args.select));
       },
       async count(args: { where?: FakeRow }) {
         return db.users.filter((u) => matchesWhere(u, args.where ?? {})).length;
       },
-      async create(args: {
-        data: FakeRow;
-        select?: Record<string, boolean>;
-      }) {
+      async create(args: { data: FakeRow; select?: Record<string, boolean> }) {
         const now = new Date();
         const row: FakeRow = {
           id: randomUUID(),
@@ -156,13 +179,34 @@ function createFakePrisma(db: FakeDb) {
         Object.assign(row, args.data);
         return { ...row };
       },
+      async updateMany(args: { where: FakeRow; data: FakeRow }) {
+        let count = 0;
+        for (const token of db.refreshTokens) {
+          if (
+            (args.where['id'] === undefined ||
+              token['id'] === args.where['id']) &&
+            (args.where['userId'] === undefined ||
+              token['userId'] === args.where['userId']) &&
+            (args.where['revokedAt'] === undefined ||
+              token['revokedAt'] === args.where['revokedAt'])
+          ) {
+            Object.assign(token, args.data);
+            count++;
+          }
+        }
+        return { count };
+      },
     },
     product: {
       async findMany() {
         return [];
       },
+      async count() {
+        return 0;
+      },
     },
   };
+  return fakePrisma;
 }
 
 describe('Auth & Users (e2e)', () => {
@@ -240,7 +284,10 @@ describe('Auth & Users (e2e)', () => {
         transform: true,
       }),
     );
-    app.useGlobalFilters(new PrismaExceptionFilter(), new AllExceptionsFilter());
+    app.useGlobalFilters(
+      new PrismaExceptionFilter(),
+      new AllExceptionsFilter(),
+    );
     await app.init();
   });
 
@@ -252,8 +299,10 @@ describe('Auth & Users (e2e)', () => {
     // Fresh state per test: users may have been created/renamed/deactivated.
     await seedUsers();
     if (!adminToken) {
-      adminToken = (await loginAs('admin@example.com', 'Admin123!')).accessToken;
-      staffToken = (await loginAs('staff@example.com', 'Staff123!')).accessToken;
+      adminToken = (await loginAs('admin@example.com', 'Admin123!'))
+        .accessToken;
+      staffToken = (await loginAs('staff@example.com', 'Staff123!'))
+        .accessToken;
     }
   });
 
@@ -297,6 +346,41 @@ describe('Auth & Users (e2e)', () => {
         .post('/api/v1/auth/login')
         .send({ email: 'not-an-email' })
         .expect(400);
+    });
+  });
+
+  describe('POST /auth/register', () => {
+    it('always creates a CUSTOMER account', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/api/v1/auth/register')
+        .send({
+          name: 'New Customer',
+          email: 'newcustomer@example.com',
+          password: 'Customer123!',
+        })
+        .expect(201);
+
+      expect(res.body.user.role).toBe('CUSTOMER');
+      const stored = db.users.find(
+        (u) => u['email'] === 'newcustomer@example.com',
+      );
+      expect(stored?.role).toBe('CUSTOMER');
+    });
+
+    it('rejects a client-supplied role with 400 and creates nothing', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/register')
+        .send({
+          name: 'Sneaky Admin',
+          email: 'sneaky@example.com',
+          password: 'Sneaky123!',
+          role: 'ADMIN',
+        })
+        .expect(400);
+
+      expect(
+        db.users.find((u) => u['email'] === 'sneaky@example.com'),
+      ).toBeUndefined();
     });
   });
 
@@ -424,6 +508,40 @@ describe('Auth & Users (e2e)', () => {
       await loginAs('created@example.com', 'Created123!');
     });
 
+    it.each(['ADMIN', 'STAFF', 'SUPPORT', 'CUSTOMER'] as const)(
+      'lets an admin create a %s user',
+      async (role) => {
+        const email = `${role.toLowerCase()}-created@example.com`;
+
+        const res = await request(app.getHttpServer())
+          .post('/api/v1/users')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            name: `${role} User`,
+            email,
+            password: 'Created123!',
+            role,
+          })
+          .expect(201);
+
+        expect(res.body.role).toBe(role);
+        expect(db.users.find((u) => u['email'] === email)?.role).toBe(role);
+      },
+    );
+
+    it('rejects an unknown role with 400', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/users')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Nope',
+          email: 'nope-role@example.com',
+          password: 'Whatever123!',
+          role: 'OWNER',
+        })
+        .expect(400);
+    });
+
     it('rejects a duplicate email with 409', async () => {
       await request(app.getHttpServer())
         .post('/api/v1/users')
@@ -489,11 +607,88 @@ describe('Auth & Users (e2e)', () => {
       expect(staff).toBeDefined();
     });
 
-    it('rejects self-deactivation with 422', async () => {
+    it('forbids STAFF from updating or deactivating users (403)', async () => {
+      await request(app.getHttpServer())
+        .patch('/api/v1/users/11111111-1111-4111-8111-111111111111')
+        .set('Authorization', `Bearer ${staffToken}`)
+        .send({ name: 'Nope' })
+        .expect(403);
+
+      await request(app.getHttpServer())
+        .delete('/api/v1/users/11111111-1111-4111-8111-111111111111')
+        .set('Authorization', `Bearer ${staffToken}`)
+        .expect(403);
+    });
+
+    it('revokes refresh tokens when an admin changes a role', async () => {
+      const login = await loginAs('staff@example.com', 'Staff123!');
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/users/22222222-2222-4222-8222-222222222222')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ role: 'SUPPORT' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: login.refreshToken })
+        .expect(401);
+    });
+
+    it('revokes refresh tokens when an admin deactivates an account', async () => {
+      const login = await loginAs('staff@example.com', 'Staff123!');
+
+      await request(app.getHttpServer())
+        .delete('/api/v1/users/22222222-2222-4222-8222-222222222222')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(204);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/refresh')
+        .send({ refreshToken: login.refreshToken })
+        .expect(401);
+    });
+
+    it('rejects self-deactivation of the last active admin with 409', async () => {
+      const res = await request(app.getHttpServer())
+        .delete('/api/v1/auth/me')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .expect(409);
+
+      expect(res.body.message).toBe('At least one active ADMIN must remain');
+      expect(
+        db.users.find(
+          (u) => u['id'] === '11111111-1111-4111-8111-111111111111',
+        )?.isActive,
+      ).toBe(true);
+    });
+
+    it('rejects self-deactivation with 422 when another admin exists', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/users')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Second Admin',
+          email: 'second-admin@example.com',
+          password: 'Second123!',
+          role: 'ADMIN',
+        })
+        .expect(201);
+
       await request(app.getHttpServer())
         .delete('/api/v1/users/11111111-1111-4111-8111-111111111111')
         .set('Authorization', `Bearer ${adminToken}`)
         .expect(422);
+    });
+
+    it('rejects demoting the last active admin with 409', async () => {
+      const res = await request(app.getHttpServer())
+        .patch('/api/v1/users/11111111-1111-4111-8111-111111111111')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ role: 'STAFF' })
+        .expect(409);
+
+      expect(res.body.message).toBe('At least one active ADMIN must remain');
     });
   });
 

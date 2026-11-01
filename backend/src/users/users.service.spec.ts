@@ -8,6 +8,11 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { UsersService, type UserResponse } from './users.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { Prisma } from '../generated/prisma/client.js';
+import { AuditService } from '../audit/audit.service.js';
+import {
+  ImageStorageService,
+  MAX_AVATAR_SIZE_BYTES,
+} from '../storage/image-storage.service.js';
 
 describe('UsersService', () => {
   let service: UsersService;
@@ -17,7 +22,11 @@ describe('UsersService', () => {
   const userCount = vi.fn();
   const userCreate = vi.fn();
   const userUpdate = vi.fn();
+  const refreshTokenUpdateMany = vi.fn();
   const $transactionWithOptions = vi.fn();
+  const imageSave = vi.fn();
+  const imageDelete = vi.fn();
+  const auditLog = vi.fn();
 
   const ADMIN_ID = '11111111-1111-4111-8111-111111111111';
   const STAFF_ID = '22222222-2222-4222-8222-222222222222';
@@ -38,10 +47,15 @@ describe('UsersService', () => {
     userCount.mockReset();
     userCreate.mockReset();
     userUpdate.mockReset();
+    refreshTokenUpdateMany.mockReset();
     $transactionWithOptions.mockReset();
+    imageSave.mockReset();
+    imageDelete.mockReset();
+    auditLog.mockReset();
     userFindMany.mockResolvedValue([]);
     userCount.mockResolvedValue(0);
     userUpdate.mockResolvedValue(adminRow());
+    refreshTokenUpdateMany.mockResolvedValue({ count: 2 });
     // The serializable last-admin guard runs its count + write through the
     // transaction client; reuse the same mocks as the transaction client.
     $transactionWithOptions.mockImplementation(
@@ -51,16 +65,23 @@ describe('UsersService', () => {
             count: typeof userCount;
             update: typeof userUpdate;
           };
+          refreshToken: { updateMany: typeof refreshTokenUpdateMany };
         }) => Promise<unknown>,
       ) =>
         fn({
           user: { count: userCount, update: userUpdate },
+          refreshToken: { updateMany: refreshTokenUpdateMany },
         }),
     );
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         UsersService,
+        { provide: AuditService, useValue: { log: auditLog } },
+        {
+          provide: ImageStorageService,
+          useValue: { save: imageSave, delete: imageDelete },
+        },
         {
           provide: PrismaService,
           useValue: {
@@ -83,15 +104,17 @@ describe('UsersService', () => {
   describe('create', () => {
     it('hashes the password and never returns or persists the plain value', async () => {
       userFindUnique.mockResolvedValue(null);
-      userCreate.mockImplementation(async (args: { data: Record<string, unknown> }) => ({
-        id: STAFF_ID,
-        name: args.data.name,
-        email: args.data.email,
-        role: args.data.role,
-        isActive: true,
-        createdAt: new Date('2026-10-20T00:00:00Z'),
-        updatedAt: new Date('2026-10-20T00:00:00Z'),
-      }));
+      userCreate.mockImplementation(
+        async (args: { data: Record<string, unknown> }) => ({
+          id: STAFF_ID,
+          name: args.data.name,
+          email: args.data.email,
+          role: args.data.role,
+          isActive: true,
+          createdAt: new Date('2026-10-20T00:00:00Z'),
+          updatedAt: new Date('2026-10-20T00:00:00Z'),
+        }),
+      );
 
       const result = await service.create({
         name: 'New User',
@@ -130,14 +153,21 @@ describe('UsersService', () => {
 
       const result = await service.findAll({});
 
-      expect(result.meta).toEqual({ page: 1, limit: 20, total: 1, totalPages: 1 });
+      expect(result.meta).toEqual({
+        page: 1,
+        limit: 20,
+        total: 1,
+        totalPages: 1,
+      });
       expect(result.data).toHaveLength(1);
       expect(userFindMany).toHaveBeenCalledWith(
         expect.objectContaining({
           skip: 0,
           take: 20,
           orderBy: { createdAt: 'desc' },
-          select: expect.not.objectContaining({ passwordHash: expect.anything() }),
+          select: expect.not.objectContaining({
+            passwordHash: expect.anything(),
+          }),
         }),
       );
       expect(JSON.stringify(result)).not.toContain('passwordHash');
@@ -175,7 +205,9 @@ describe('UsersService', () => {
       userFindUnique.mockResolvedValue(adminRow());
 
       await expect(service.findOne(ADMIN_ID)).resolves.toEqual(adminRow());
-      expect(userFindUnique.mock.calls[0][0].select.passwordHash).toBeUndefined();
+      expect(
+        userFindUnique.mock.calls[0][0].select.passwordHash,
+      ).toBeUndefined();
     });
 
     it('throws 404 when it does not exist', async () => {
@@ -219,6 +251,7 @@ describe('UsersService', () => {
 
     it('rejects an admin changing their own role (422)', async () => {
       userFindUnique.mockResolvedValue(adminRow());
+      userCount.mockResolvedValue(1); // another active admin still exists
 
       await expect(
         service.update(ADMIN_ID, { role: 'STAFF' }, ADMIN_ID),
@@ -226,8 +259,19 @@ describe('UsersService', () => {
       expect(userUpdate).not.toHaveBeenCalled();
     });
 
+    it('rejects a last-admin self-demotion with 409', async () => {
+      userFindUnique.mockResolvedValue(adminRow());
+      userCount.mockResolvedValue(0);
+
+      await expect(
+        service.update(ADMIN_ID, { role: 'STAFF' }, ADMIN_ID),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(userUpdate).not.toHaveBeenCalled();
+    });
+
     it('rejects an admin deactivating themselves (422)', async () => {
       userFindUnique.mockResolvedValue(adminRow());
+      userCount.mockResolvedValue(1); // another active admin still exists
 
       await expect(
         service.update(ADMIN_ID, { isActive: false }, ADMIN_ID),
@@ -235,13 +279,23 @@ describe('UsersService', () => {
       expect(userUpdate).not.toHaveBeenCalled();
     });
 
-    it('rejects demoting the last active admin (422)', async () => {
+    it('rejects a last-admin self-deactivation with 409', async () => {
+      userFindUnique.mockResolvedValue(adminRow());
+      userCount.mockResolvedValue(0);
+
+      await expect(
+        service.update(ADMIN_ID, { isActive: false }, ADMIN_ID),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(userUpdate).not.toHaveBeenCalled();
+    });
+
+    it('rejects demoting the last active admin (409)', async () => {
       userFindUnique.mockResolvedValue(adminRow());
       userCount.mockResolvedValue(0);
 
       await expect(
         service.update(ADMIN_ID, { role: 'STAFF' }, STAFF_ID),
-      ).rejects.toBeInstanceOf(UnprocessableEntityException);
+      ).rejects.toBeInstanceOf(ConflictException);
       // The count and the write share one serializable transaction.
       expect($transactionWithOptions).toHaveBeenCalledWith(
         expect.any(Function),
@@ -251,6 +305,59 @@ describe('UsersService', () => {
         where: { role: 'ADMIN', isActive: true, id: { not: ADMIN_ID } },
       });
       expect(userUpdate).not.toHaveBeenCalled();
+    });
+
+    it('revokes every active refresh token when the role changes', async () => {
+      userFindUnique.mockResolvedValue({
+        ...adminRow(),
+        id: STAFF_ID,
+        role: 'STAFF' as const,
+        email: 'staff@example.com',
+      });
+      userUpdate.mockResolvedValue({
+        ...adminRow(),
+        id: STAFF_ID,
+        role: 'SUPPORT' as const,
+      });
+
+      await service.update(STAFF_ID, { role: 'SUPPORT' }, ADMIN_ID);
+
+      expect(refreshTokenUpdateMany).toHaveBeenCalledWith({
+        where: { userId: STAFF_ID, revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+    });
+
+    it('does not revoke refresh tokens when the role is unchanged', async () => {
+      userFindUnique.mockResolvedValue({
+        ...adminRow(),
+        id: STAFF_ID,
+        role: 'STAFF' as const,
+      });
+
+      await service.update(STAFF_ID, { role: 'STAFF' }, ADMIN_ID);
+
+      expect(refreshTokenUpdateMany).not.toHaveBeenCalled();
+    });
+
+    it('revokes every active refresh token when the account is deactivated', async () => {
+      userFindUnique.mockResolvedValue({
+        ...adminRow(),
+        id: STAFF_ID,
+        role: 'STAFF' as const,
+      });
+      userUpdate.mockResolvedValue({
+        ...adminRow(),
+        id: STAFF_ID,
+        isActive: false,
+      });
+
+      await service.update(STAFF_ID, { isActive: false }, ADMIN_ID);
+
+      expect(refreshTokenUpdateMany).toHaveBeenCalledWith({
+        where: { userId: STAFF_ID, revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
     });
 
     it('retries once on a P2034 write conflict and still applies the update', async () => {
@@ -264,13 +371,11 @@ describe('UsersService', () => {
       $transactionWithOptions
         .mockRejectedValueOnce(conflict)
         // Second attempt runs through the real (mocked) transaction body.
-        .mockImplementationOnce(
-          async (
-            fn: (tx: unknown) => Promise<unknown>,
-          ) =>
-            fn({
-              user: { count: userCount, update: userUpdate },
-            }),
+        .mockImplementationOnce(async (fn: (tx: unknown) => Promise<unknown>) =>
+          fn({
+            user: { count: userCount, update: userUpdate },
+            refreshToken: { updateMany: refreshTokenUpdateMany },
+          }),
         );
 
       const result = await service.update(
@@ -308,6 +413,100 @@ describe('UsersService', () => {
     });
   });
 
+  describe('avatar', () => {
+    const file = {
+      buffer: Buffer.from('image'),
+      size: 5,
+      originalname: 'me.png',
+      mimetype: 'image/png',
+    };
+
+    it('saves into avatars/, updates the current user and removes the old file', async () => {
+      userFindUnique.mockResolvedValue({
+        ...adminRow(),
+        avatarUrl: '/uploads/avatars/old.png',
+      });
+      imageSave.mockResolvedValue('/uploads/avatars/new.png');
+      userUpdate.mockResolvedValue({
+        ...adminRow(),
+        avatarUrl: '/uploads/avatars/new.png',
+      });
+
+      const result = await service.updateAvatar(STAFF_ID, file);
+
+      expect(imageSave).toHaveBeenCalledWith(
+        file,
+        'avatars',
+        MAX_AVATAR_SIZE_BYTES,
+      );
+      expect(userFindUnique).toHaveBeenCalledWith({
+        where: { id: STAFF_ID },
+        select: expect.anything(),
+      });
+      expect(userUpdate).toHaveBeenCalledWith({
+        where: { id: STAFF_ID },
+        data: { avatarUrl: '/uploads/avatars/new.png' },
+        select: expect.anything(),
+      });
+      expect(imageDelete).toHaveBeenCalledWith('/uploads/avatars/old.png');
+      expect(result.avatarUrl).toBe('/uploads/avatars/new.png');
+      expect(result).not.toHaveProperty('passwordHash');
+      expect(JSON.stringify(result)).not.toContain('passwordHash');
+    });
+
+    it('deletes the newly written file when the database update fails', async () => {
+      userFindUnique.mockResolvedValue({
+        ...adminRow(),
+        avatarUrl: '/uploads/avatars/old.png',
+      });
+      imageSave.mockResolvedValue('/uploads/avatars/new.png');
+      const boom = new Error('db down');
+      userUpdate.mockRejectedValue(boom);
+
+      await expect(service.updateAvatar(STAFF_ID, file)).rejects.toBe(boom);
+
+      expect(imageDelete).toHaveBeenCalledTimes(1);
+      expect(imageDelete).toHaveBeenCalledWith('/uploads/avatars/new.png');
+      expect(imagesDeleteOfOldFile()).toBe(false);
+    });
+
+    it('clears avatarUrl and deletes the local file', async () => {
+      userFindUnique.mockResolvedValue({
+        ...adminRow(),
+        avatarUrl: '/uploads/avatars/old.png',
+      });
+      userUpdate.mockResolvedValue({ ...adminRow(), avatarUrl: null });
+
+      await expect(service.removeAvatar(STAFF_ID)).resolves.toBeUndefined();
+
+      expect(userUpdate).toHaveBeenCalledWith({
+        where: { id: STAFF_ID },
+        data: { avatarUrl: null },
+        select: expect.anything(),
+      });
+      expect(imageDelete).toHaveBeenCalledWith('/uploads/avatars/old.png');
+    });
+
+    it('throws 404 for a missing user', async () => {
+      userFindUnique.mockResolvedValue(null);
+
+      await expect(service.updateAvatar(STAFF_ID, file)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      await expect(service.removeAvatar(STAFF_ID)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(imageSave).not.toHaveBeenCalled();
+      expect(userUpdate).not.toHaveBeenCalled();
+    });
+
+    function imagesDeleteOfOldFile(): boolean {
+      return imageDelete.mock.calls.some(
+        ([url]) => url === '/uploads/avatars/old.png',
+      );
+    }
+  });
+
   describe('deactivate', () => {
     it('soft-deletes by setting isActive=false', async () => {
       userFindUnique.mockResolvedValue({
@@ -318,31 +517,62 @@ describe('UsersService', () => {
       });
       userUpdate.mockResolvedValue({});
 
-      await expect(service.deactivate(STAFF_ID, ADMIN_ID)).resolves.toBeUndefined();
+      await expect(
+        service.deactivate(STAFF_ID, ADMIN_ID),
+      ).resolves.toBeUndefined();
 
       expect(userUpdate).toHaveBeenCalledWith({
         where: { id: STAFF_ID },
         data: { isActive: false },
+        select: expect.objectContaining({ id: true, isActive: true }),
       });
     });
 
     it('rejects self-deactivation (422)', async () => {
       userFindUnique.mockResolvedValue(adminRow());
+      userCount.mockResolvedValue(1); // another active admin still exists
 
-      await expect(service.deactivate(ADMIN_ID, ADMIN_ID)).rejects.toBeInstanceOf(
-        UnprocessableEntityException,
-      );
+      await expect(
+        service.deactivate(ADMIN_ID, ADMIN_ID),
+      ).rejects.toBeInstanceOf(UnprocessableEntityException);
       expect(userUpdate).not.toHaveBeenCalled();
     });
 
-    it('rejects deactivating the last active admin (422)', async () => {
+    it('rejects last-admin self-deactivation with 409', async () => {
       userFindUnique.mockResolvedValue(adminRow());
       userCount.mockResolvedValue(0);
 
-      await expect(service.deactivate(ADMIN_ID, STAFF_ID)).rejects.toBeInstanceOf(
-        UnprocessableEntityException,
-      );
+      await expect(
+        service.deactivate(ADMIN_ID, ADMIN_ID),
+      ).rejects.toBeInstanceOf(ConflictException);
       expect(userUpdate).not.toHaveBeenCalled();
+    });
+
+    it('rejects deactivating the last active admin (409)', async () => {
+      userFindUnique.mockResolvedValue(adminRow());
+      userCount.mockResolvedValue(0);
+
+      await expect(
+        service.deactivate(ADMIN_ID, STAFF_ID),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(userUpdate).not.toHaveBeenCalled();
+    });
+
+    it('revokes every active refresh token when deactivating', async () => {
+      userFindUnique.mockResolvedValue({
+        ...adminRow(),
+        id: STAFF_ID,
+        role: 'STAFF' as const,
+        email: 'staff@example.com',
+      });
+      userUpdate.mockResolvedValue({});
+
+      await service.deactivate(STAFF_ID, ADMIN_ID);
+
+      expect(refreshTokenUpdateMany).toHaveBeenCalledWith({
+        where: { userId: STAFF_ID, revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
     });
 
     it('allows deactivating an admin when another active admin remains', async () => {
@@ -350,16 +580,18 @@ describe('UsersService', () => {
       userCount.mockResolvedValue(1);
       userUpdate.mockResolvedValue({});
 
-      await expect(service.deactivate(ADMIN_ID, STAFF_ID)).resolves.toBeUndefined();
+      await expect(
+        service.deactivate(ADMIN_ID, STAFF_ID),
+      ).resolves.toBeUndefined();
       expect(userUpdate).toHaveBeenCalled();
     });
 
     it('throws 404 for a missing user', async () => {
       userFindUnique.mockResolvedValue(null);
 
-      await expect(service.deactivate('missing-id', ADMIN_ID)).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.deactivate('missing-id', ADMIN_ID),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 });

@@ -2,12 +2,17 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 
 import { PrismaService } from '../prisma/prisma.service.js';
 import { Prisma } from '../generated/prisma/client.js';
+import { AuditService } from '../audit/audit.service.js';
 import { CreateProductDto } from './dto/create-product.dto.js';
 import { UpdateProductDto } from './dto/update-product.dto.js';
 import {
   ListProductsQueryDto,
   type ProductSortableField,
 } from './dto/list-products.query.dto.js';
+import {
+  ImageStorageService,
+  type UploadedImageFile,
+} from '../storage/image-storage.service.js';
 
 /**
  * Contract §3.4 `Product` shape. `price`/`costPrice` are Decimal(12,2) in the
@@ -96,7 +101,11 @@ const SORT_COLUMNS: Record<ProductSortableField, string> = {
 
 @Injectable()
 export class ProductsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+    private readonly images: ImageStorageService,
+  ) {}
 
   /**
    * Paginated, filtered and sorted product list (contract §3.4). Response
@@ -259,12 +268,16 @@ export class ProductsService {
     return serializeProduct(product, role);
   }
 
-  async create(dto: CreateProductDto): Promise<ProductResponse> {
+  async create(
+    dto: CreateProductDto,
+    userId?: string,
+  ): Promise<ProductResponse> {
     // Contract §3.4: 404 when the product references a nonexistent
     // category/supplier. Checked up front so the API error is precise
     // (a DB FK failure would surface as a generic P2003 conflict).
     await this.assertCategoryExists(dto.categoryId);
-    if (dto.supplierId !== undefined) {
+    // Explicit `null` means "no supplier", the same as omitting the field.
+    if (dto.supplierId !== undefined && dto.supplierId !== null) {
       await this.assertSupplierExists(dto.supplierId);
     }
 
@@ -285,6 +298,14 @@ export class ProductsService {
       select: PRODUCT_SELECT,
     });
 
+    await this.audit.log({
+      userId,
+      action: 'product.created',
+      entityType: 'product',
+      entityId: product.id,
+      newValues: product,
+    });
+
     return serializeProduct(product, ADMIN_ROLE);
   }
 
@@ -295,11 +316,15 @@ export class ProductsService {
    * `sku`/`barcode` hits the unique index and the global Prisma filter
    * answers 409.
    */
-  async update(id: string, dto: UpdateProductDto): Promise<ProductResponse> {
+  async update(
+    id: string,
+    dto: UpdateProductDto,
+    userId?: string,
+  ): Promise<ProductResponse> {
     const where = { id };
     const existing = await this.prisma.product.findUnique({
       where,
-      select: { id: true },
+      select: PRODUCT_SELECT,
     });
 
     if (!existing) {
@@ -351,17 +376,107 @@ export class ProductsService {
       select: PRODUCT_SELECT,
     });
 
+    // Issue #34: the old snapshot and the new row make price changes
+    // auditable (`oldValues.price` → `newValues.price`).
+    await this.audit.log({
+      userId,
+      action: 'product.updated',
+      entityType: 'product',
+      entityId: id,
+      oldValues: existing,
+      newValues: product,
+    });
+
     return serializeProduct(product, ADMIN_ROLE);
+  }
+
+  /**
+   * Replaces a product image with an uploaded file. The new file is written
+   * first; if the database update fails it is removed again so no orphan is
+   * left behind. The previous local file is deleted only after the DB commit.
+   */
+  async uploadImage(
+    id: string,
+    file: UploadedImageFile | undefined,
+    userId?: string,
+  ): Promise<ProductResponse> {
+    const existing = await this.prisma.product.findUnique({
+      where: { id },
+      select: PRODUCT_SELECT,
+    });
+
+    if (!existing) {
+      throw new NotFoundException(`Product ${id} not found`);
+    }
+
+    const imageUrl = await this.images.save(file, 'products');
+
+    let product: Prisma.ProductGetPayload<{ select: typeof PRODUCT_SELECT }>;
+    try {
+      product = await this.prisma.product.update({
+        where: { id },
+        data: { imageUrl },
+        select: PRODUCT_SELECT,
+      });
+    } catch (error) {
+      await this.images.delete(imageUrl);
+      throw error;
+    }
+
+    await this.images.delete(existing.imageUrl);
+
+    await this.audit.log({
+      userId,
+      action: 'product.image_updated',
+      entityType: 'product',
+      entityId: id,
+      oldValues: existing,
+      newValues: product,
+    });
+
+    return serializeProduct(product, ADMIN_ROLE);
+  }
+
+  /**
+   * Clears a product image. The local file is removed only after the database
+   * update succeeds; external URLs are never touched on disk.
+   */
+  async removeImage(id: string, userId?: string): Promise<void> {
+    const existing = await this.prisma.product.findUnique({
+      where: { id },
+      select: PRODUCT_SELECT,
+    });
+
+    if (!existing) {
+      throw new NotFoundException(`Product ${id} not found`);
+    }
+
+    const product = await this.prisma.product.update({
+      where: { id },
+      data: { imageUrl: null },
+      select: PRODUCT_SELECT,
+    });
+
+    await this.images.delete(existing.imageUrl);
+
+    await this.audit.log({
+      userId,
+      action: 'product.image_deleted',
+      entityType: 'product',
+      entityId: id,
+      oldValues: existing,
+      newValues: product,
+    });
   }
 
   /**
    * AD-001 soft delete: set `isActive = false`, never remove the row.
    * Idempotent-ish: deactivating twice keeps `isActive = false`.
    */
-  async remove(id: string): Promise<void> {
+  async remove(id: string, userId?: string): Promise<void> {
     const existing = await this.prisma.product.findUnique({
       where: { id },
-      select: { id: true },
+      select: PRODUCT_SELECT,
     });
 
     if (!existing) {
@@ -372,6 +487,15 @@ export class ProductsService {
       where: { id },
       data: { isActive: false },
       select: { id: true },
+    });
+
+    await this.audit.log({
+      userId,
+      action: 'product.deleted',
+      entityType: 'product',
+      entityId: id,
+      oldValues: existing,
+      newValues: { ...existing, isActive: false },
     });
   }
 

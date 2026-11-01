@@ -9,6 +9,12 @@ import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { UserRole } from '../generated/prisma/enums.js';
+import { AuditService } from '../audit/audit.service.js';
+import {
+  ImageStorageService,
+  MAX_AVATAR_SIZE_BYTES,
+  type UploadedImageFile,
+} from '../storage/image-storage.service.js';
 import { CreateUserDto } from './dto/create-user.dto.js';
 import { UpdateUserDto } from './dto/update-user.dto.js';
 import { ListUsersQueryDto } from './dto/list-users.query.dto.js';
@@ -18,6 +24,7 @@ const USER_SELECT = {
   id: true,
   name: true,
   email: true,
+  avatarUrl: true,
   role: true,
   isActive: true,
   createdAt: true,
@@ -29,6 +36,7 @@ export interface UserResponse {
   id: string;
   name: string;
   email: string;
+  avatarUrl: string | null;
   role: UserRole;
   isActive: boolean;
   createdAt: Date;
@@ -47,7 +55,11 @@ const MAX_SERIALIZATION_RETRIES = 1;
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly audit: AuditService,
+    private readonly images: ImageStorageService,
+  ) {}
 
   async create(createUserDto: CreateUserDto): Promise<UserResponse> {
     await this.assertEmailAvailable(createUserDto.email);
@@ -139,18 +151,36 @@ export class UsersService {
       await this.assertEmailAvailable(updateUserDto.email);
     }
 
-    // Contract §3.2: 422 for self role change / self deactivation.
-    if (
+    const selfRoleChange =
       id === currentUserId &&
       updateUserDto.role !== undefined &&
-      updateUserDto.role !== user.role
-    ) {
+      updateUserDto.role !== user.role;
+    const selfDeactivation =
+      id === currentUserId && updateUserDto.isActive === false;
+    const selfWouldRemoveActiveAdmin =
+      user.role === 'ADMIN' &&
+      user.isActive &&
+      (selfRoleChange || selfDeactivation);
+
+    // The last active ADMIN can never be demoted or deactivated, including by
+    // themselves; this takes precedence over the generic self-change 422.
+    if (selfWouldRemoveActiveAdmin) {
+      const otherActiveAdmins = await this.prisma.user.count({
+        where: { role: 'ADMIN', isActive: true, id: { not: id } },
+      });
+      if (otherActiveAdmins === 0) {
+        throw new ConflictException('At least one active ADMIN must remain');
+      }
+    }
+
+    // Contract §3.2: 422 for self role change / self deactivation.
+    if (selfRoleChange) {
       throw new UnprocessableEntityException(
         'Admins cannot change their own role',
       );
     }
 
-    if (id === currentUserId && updateUserDto.isActive === false) {
+    if (selfDeactivation) {
       throw new UnprocessableEntityException(
         'Admins cannot deactivate their own account',
       );
@@ -159,7 +189,7 @@ export class UsersService {
     const needsAdminGuard =
       user.role === 'ADMIN' &&
       user.isActive &&
-      ((updateUserDto.isActive === false) ||
+      (updateUserDto.isActive === false ||
         (updateUserDto.role !== undefined && updateUserDto.role !== 'ADMIN'));
 
     const data: Prisma.UserUncheckedUpdateInput = {};
@@ -176,14 +206,134 @@ export class UsersService {
       data.isActive = updateUserDto.isActive;
     }
 
-    return this.withLastAdminGuard(needsAdminGuard, id, (tx) =>
-      tx.user.update({ where: { id }, data, select: USER_SELECT }),
+    const roleChanged =
+      updateUserDto.role !== undefined && updateUserDto.role !== user.role;
+    const deactivated =
+      updateUserDto.isActive === false && user.isActive;
+
+    return this.withLastAdminGuard(needsAdminGuard, id, async (tx) => {
+      const updated = await tx.user.update({
+        where: { id },
+        data,
+        select: USER_SELECT,
+      });
+
+      // A role change or deactivation invalidates every active session.
+      let refreshTokensRevoked = 0;
+      if (roleChanged || deactivated) {
+        const revoked = await tx.refreshToken.updateMany({
+          where: { userId: id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        refreshTokensRevoked = revoked.count;
+      }
+
+      // Issue #34: actor + before/after inside the guard transaction.
+      await this.audit.log(
+        {
+          userId: currentUserId,
+          action: 'user.updated',
+          entityType: 'user',
+          entityId: id,
+          oldValues: user,
+          newValues: {
+            ...updated,
+            ...(roleChanged || deactivated ? { refreshTokensRevoked } : {}),
+          },
+        },
+        tx,
+      );
+
+      return updated;
+    });
+  }
+
+  /**
+   * Replaces the authenticated user's avatar. The new file is written first;
+   * if the database update fails it is removed again so no orphan is left
+   * behind. The previous local file is deleted only after the DB update.
+   */
+  async updateAvatar(
+    userId: string,
+    file: UploadedImageFile | undefined,
+  ): Promise<UserResponse> {
+    const existing = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: USER_SELECT,
+    });
+
+    if (!existing) {
+      throw new NotFoundException(`User ${userId} not found`);
+    }
+
+    const avatarUrl = await this.images.save(
+      file,
+      'avatars',
+      MAX_AVATAR_SIZE_BYTES,
     );
+
+    let updated: UserResponse;
+    try {
+      updated = await this.prisma.user.update({
+        where: { id: userId },
+        data: { avatarUrl },
+        select: USER_SELECT,
+      });
+    } catch (error) {
+      await this.images.delete(avatarUrl);
+      throw error;
+    }
+
+    await this.images.delete(existing.avatarUrl);
+
+    await this.audit.log({
+      userId,
+      action: 'user.avatar_updated',
+      entityType: 'user',
+      entityId: userId,
+      oldValues: existing,
+      newValues: updated,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Clears the authenticated user's avatar. The local file is removed only
+   * after the database update succeeds; external URLs are never touched.
+   */
+  async removeAvatar(userId: string): Promise<void> {
+    const existing = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: USER_SELECT,
+    });
+
+    if (!existing) {
+      throw new NotFoundException(`User ${userId} not found`);
+    }
+
+    const updated = await this.prisma.user.update({
+      where: { id: userId },
+      data: { avatarUrl: null },
+      select: USER_SELECT,
+    });
+
+    await this.images.delete(existing.avatarUrl);
+
+    await this.audit.log({
+      userId,
+      action: 'user.avatar_deleted',
+      entityType: 'user',
+      entityId: userId,
+      oldValues: existing,
+      newValues: updated,
+    });
   }
 
   /**
    * Deactivate (AD-001 soft delete): `isActive = false`, row kept. Enforces
-   * the same 422 rules as PATCH with `isActive: false`.
+   * the same 422 self-deactivation rule as PATCH, plus the last-active-ADMIN
+   * 409 safety rule, and revokes every active refresh token.
    */
   async deactivate(id: string, currentUserId: string): Promise<void> {
     const user = await this.prisma.user.findUnique({
@@ -196,6 +346,16 @@ export class UsersService {
     }
 
     if (id === currentUserId) {
+      // The last active ADMIN can never be deactivated, even by themselves.
+      if (user.role === 'ADMIN' && user.isActive) {
+        const otherActiveAdmins = await this.prisma.user.count({
+          where: { role: 'ADMIN', isActive: true, id: { not: id } },
+        });
+        if (otherActiveAdmins === 0) {
+          throw new ConflictException('At least one active ADMIN must remain');
+        }
+      }
+
       throw new UnprocessableEntityException(
         'Admins cannot deactivate their own account',
       );
@@ -204,7 +364,33 @@ export class UsersService {
     await this.withLastAdminGuard(
       user.role === 'ADMIN' && user.isActive,
       id,
-      (tx) => tx.user.update({ where: { id }, data: { isActive: false } }),
+      async (tx) => {
+        const updated = await tx.user.update({
+          where: { id },
+          data: { isActive: false },
+          select: USER_SELECT,
+        });
+
+        // Deactivation invalidates every active session immediately.
+        const revoked = await tx.refreshToken.updateMany({
+          where: { userId: id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+
+        await this.audit.log(
+          {
+            userId: currentUserId,
+            action: 'user.deactivated',
+            entityType: 'user',
+            entityId: id,
+            oldValues: user,
+            newValues: { ...updated, refreshTokensRevoked: revoked.count },
+          },
+          tx,
+        );
+
+        return updated;
+      },
     );
   }
 
@@ -220,12 +406,11 @@ export class UsersService {
   }
 
   /**
-   * Contract §3.2: 422 when an operation would leave zero active admins.
-   *
-   * The count and the write run in ONE transaction at the Serializable
-   * isolation level, so two admins demoting each other concurrently cannot
-   * both succeed and drain the system to zero active admins. PRISMA P2034
-   * (write conflict / serialization anomaly) is retried once.
+   * Safety rule: an operation must never leave zero active admins. The count
+   * and the write run in ONE transaction at the Serializable isolation level,
+   * so two admins demoting each other concurrently cannot both succeed and
+   * drain the system to zero active admins. PRISMA P2034 (write conflict /
+   * serialization anomaly) is retried once. Violations answer 409.
    */
   private withLastAdminGuard<T>(
     needsAdminGuard: boolean,
@@ -242,7 +427,7 @@ export class UsersService {
             });
 
             if (otherActiveAdmins === 0) {
-              throw new UnprocessableEntityException(
+              throw new ConflictException(
                 'At least one active ADMIN must remain',
               );
             }
@@ -256,7 +441,12 @@ export class UsersService {
     return run().catch(async (error: unknown) => {
       if (attempt < MAX_SERIALIZATION_RETRIES && isWriteConflict(error)) {
         await sleep(P2034_RETRY_DELAY_MS);
-        return this.withLastAdminGuard(needsAdminGuard, userId, write, attempt + 1);
+        return this.withLastAdminGuard(
+          needsAdminGuard,
+          userId,
+          write,
+          attempt + 1,
+        );
       }
       throw error;
     });

@@ -18,7 +18,7 @@ npx prisma validate
 ```
 
 Env vars used: `DATABASE_URL` (Prisma, must match the container credentials),
-`PORT` (API port, defaults to `3000`), `JWT_SECRET` (reserved for upcoming
+`PORT` (API port; local development uses `3010`), `JWT_SECRET` (reserved for upcoming
 auth — no code reads it yet). Details in the
 [root README](../README.md#environment-variables).
 
@@ -38,15 +38,38 @@ auth — no code reads it yet). Details in the
 | `npm run lint` | oxlint over `src/` and `test/` |
 | `npm run format` | Prettier over `src/` and `test/` |
 
-Health check: `GET http://localhost:3000/` → `"Hello World!"`.
+E2E tests need a dedicated database whose name contains `test` (default:
+`inventory_test`). The test helper refuses to truncate any other database.
+Set `E2E_DATABASE_URL` to override the default test connection.
+
+### Role permission matrix suite
+
+`test/role-permission-matrix.e2e-spec.ts` is the consolidated authorization
+contract: it asserts the expected 2xx/401/403 outcome for unauthenticated,
+CUSTOMER, SUPPORT, STAFF and ADMIN callers on every registered route, and it
+fails if a route is added without a matrix entry. It also covers cross-customer
+isolation, public registration, SUPPORT limits, catalog privacy, order-note
+exclusion, detail-view auditing and last-active-ADMIN protection.
+
+It uses the real PostgreSQL test database (like the inventory suite), so make
+sure the test database is running and migrated:
+
+```bash
+# From backend/, with the test database available:
+npm run test:e2e -- test/role-permission-matrix.e2e-spec.ts
+```
+
+Set `E2E_DATABASE_URL` to point at a dedicated test database; the helper
+refuses to truncate a database whose name does not contain `test`.
+
+Health check: `GET http://localhost:3010/api/v1/health` → `{"status":"ok","db":"up"}`.
 
 ## Prisma
 
-- Schema: `prisma/schema.prisma` (shell — **no models yet**).
+- Schema: `prisma/schema.prisma` (Core models implemented).
 - Connection: `prisma.config.ts` reads `DATABASE_URL` from `backend/.env`.
 - Validate: `npx prisma validate` (from `backend/`).
-- After the team adds models: `npx prisma migrate dev`, then
-  `npx prisma generate` (client output: `src/generated/prisma/`, git-ignored).
+- Migrations: `npx prisma migrate dev`, then `npx prisma generate` (client output: `src/generated/prisma/`, git-ignored).
 
 ## Reference
 

@@ -17,8 +17,10 @@ import {
   type ProductListResponse,
   type ProductResponse,
 } from '../products/products.service.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
+import { AuditService } from '../audit/audit.service.js';
 
-/** Contract §3.6 `StockMovement` shape (all scalar fields). */
+/** Contract §3.6 `StockMovement` shape plus the light `product`/`createdBy` stamps. */
 export interface MovementResponse {
   id: string;
   productId: string;
@@ -30,6 +32,10 @@ export interface MovementResponse {
   purchaseOrderId: string | null;
   createdById: string;
   createdAt: Date;
+  /** Included so the UI can show product name/sku without extra requests. */
+  product: { id: string; name: string; sku: string };
+  /** Included so the UI can attribute the movement to a user. */
+  createdBy: { id: string; name: string };
 }
 
 /** Movement list response — §1 pagination envelope. */
@@ -67,6 +73,8 @@ const MOVEMENT_SELECT = {
   purchaseOrderId: true,
   createdById: true,
   createdAt: true,
+  product: { select: { id: true, name: true, sku: true } },
+  createdBy: { select: { id: true, name: true } },
 } satisfies Prisma.StockMovementSelect;
 
 const P2034_RETRY_DELAY_MS = 50;
@@ -76,6 +84,8 @@ export class StockService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly productsService: ProductsService,
+    private readonly notifications: NotificationsService,
+    private readonly audit: AuditService,
   ) {}
 
   /**
@@ -83,16 +93,18 @@ export class StockService {
    * `ADJUSTMENT` movement row are written inside ONE Serializable
    * transaction; P2034 write conflicts (two concurrent adjustments) are
    * retried once so neither run can observe the other's half-state.
+   * After the commit a LOW_STOCK alert fires when the product dropped to
+   * or below `minStock` (best-effort — issue #31).
    */
   async adjust(
     dto: CreateAdjustmentDto,
     userId: string,
     role: string,
   ): Promise<AdjustedStockResponse> {
-    return this.withWriteRetry(() =>
+    const result = await this.withWriteRetry(() =>
       this.prisma.$transaction(
-        (tx) =>
-          this.applyStockChange(
+        async (tx) => {
+          const change = await this.applyStockChange(
             tx,
             dto.productId,
             dto.quantityChange,
@@ -100,10 +112,40 @@ export class StockService {
             dto.reason,
             userId,
             role,
-          ),
+          );
+
+          // Issue #34: audit inside the same transaction, so the entry
+          // commits only together with the movement it describes.
+          await this.audit.log(
+            {
+              userId,
+              action: 'stock.adjusted',
+              entityType: 'stock_movement',
+              entityId: change.movement.id,
+              oldValues: {
+                productId: dto.productId,
+                quantity: change.product.quantity - dto.quantityChange,
+              },
+              newValues: {
+                productId: dto.productId,
+                quantity: change.product.quantity,
+                change: dto.quantityChange,
+                reason: dto.reason,
+              },
+            },
+            tx,
+          );
+
+          return change;
+        },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       ),
     );
+
+    // Committed — best-effort LOW_STOCK fan-out (never throws, issue #31).
+    await this.notifications.notifyLowStockIfDepleted(result.product);
+
+    return result;
   }
 
   /**
